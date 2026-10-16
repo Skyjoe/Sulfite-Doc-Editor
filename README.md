@@ -4,3 +4,5 @@ Editor de Texto para formatos odt, docx, pdf e stf (extensão própria do app), 
 Instruções de instalação:
 Faça o download da pasta. Abra seu terminal Linux nesta pasta e rode: 
 chmod +x instalar.sh./instalar.sh
+
+![Foto do App](./pasta-da-imagem/sulfite2.png)
