@@ -5,4 +5,4 @@ Instruções de instalação:
 Faça o download da pasta. Abra seu terminal Linux nesta pasta e rode: 
 chmod +x instalar.sh./instalar.sh
 
-![Foto do App](./pasta-da-imagem/sulfite2.png)
+![Foto do App](./sulfite2.png)
