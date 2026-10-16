@@ -1,25 +1,32 @@
 import sys
 import os
 import tempfile
+import base64
+import subprocess
+import re
 from datetime import datetime
+
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import (
     QAction, QFont, QColor, QTextCharFormat, 
-    QTextBlockFormat, QPageLayout, QPageSize
+    QTextBlockFormat, QPageLayout, QPageSize, QKeySequence, QIcon, QTextLength
 )
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QFileDialog, 
     QToolBar, QFontComboBox, QSpinBox, QColorDialog, 
     QLabel, QScrollArea, QWidget, QVBoxLayout,
-    QInputDialog, QMessageBox, QToolButton, QMenu, QSizePolicy
+    QInputDialog, QMessageBox, QToolButton, QMenu, QSizePolicy, QLineEdit
 )
 
 from pypdf import PdfReader, PdfWriter
 from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image, ImageDraw, ImageFont
-from PyQt6.QtGui import QIcon
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class MiniWordLinux(QMainWindow):
@@ -28,15 +35,13 @@ class MiniWordLinux(QMainWindow):
         self.setWindowTitle("Sulfite Doc Studio")
         self.setGeometry(100, 100, 1200, 850)
 
-        # Define o ícone da janela e da barra de tarefas do Linux
+        # Define o ícone da janela
         self.setWindowIcon(QIcon.fromTheme("libreoffice-writer"))
 
-        # Guarda as páginas do PDF e o histórico para Desfazer (Undo)
+        # Histórico de PDF/Imagens e variáveis de estado
         self.pdf_paginas_imagens = []
         self.historico_pdf_paginas = []
         self.caminho_pdf_atual = None
-        
-        # Variáveis de estado inicializadas no topo para evitar AttributeError
         self.modo_leitura_ativo = False
         self.margem_atual = 40
 
@@ -52,7 +57,7 @@ class MiniWordLinux(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.setCentralWidget(self.scroll_area)
 
-        # Widget central para conter a folha
+        # Container central para centralizar a folha
         self.container = QWidget()
         self.container.setStyleSheet("background-color: #323639;")
         self.container_layout = QVBoxLayout(self.container)
@@ -61,22 +66,26 @@ class MiniWordLinux(QMainWindow):
 
         # Editor de Texto Principal (Folha A4 Branca)
         self.editor = QTextEdit()
-        self.editor.setFixedWidth(800)  # Largura vertical padrão (Retrato)
+        self.editor.setFixedWidth(800)
         self.editor.setMinimumHeight(1000)
-        
+
+        # Oculta a barra de rolagem interna da folha (mantém apenas a da janela principal)
+        self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         self.atualizar_estilo_edicao()
 
-        # Estilo do Modo Leitura (Estilo Livro / Duas Colunas Horizontal)
+        # Estilo do Modo Leitura
         self.estilo_leitura = """
             QTextEdit {
-                background-color: #fbf8f1; /* Tom levemente sépia para leitura confortável */
+                background-color: #fbf8f1;
                 color: #1a1a1a;
                 border: 2px solid #007acc;
                 border-radius: 4px;
                 padding: 40px 50px;
                 font-family: 'Georgia', 'Liberation Serif', serif;
                 font-size: 13pt;
-                column-count: 2; /* Divide o texto em 2 colunas estilo livro */
+                column-count: 2;
                 column-gap: 50px;
                 column-rule: 1px solid #e0dcd3;
             }
@@ -88,11 +97,16 @@ class MiniWordLinux(QMainWindow):
         self.criar_barra_ferramentas()
         self.statusBar()
 
+        # Se um arquivo for passado via linha de comando, abre automaticamente
+        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+            self.abrir_arquivo(caminho_inicial=sys.argv[1])
+
     def atualizar_estilo_edicao(self):
+        """Garante que a folha permaneça sempre BRANCA sem injetar conflitos em tabelas."""
         self.estilo_edicao = f"""
             QTextEdit {{
-                background-color: #ffffff;
-                color: #000000;
+                background-color: #ffffff !important;
+                color: #000000 !important;
                 border: 1px solid #1a1a1a;
                 border-radius: 2px;
                 padding: {self.margem_atual}px;
@@ -149,7 +163,7 @@ class MiniWordLinux(QMainWindow):
         """)
         self.addToolBar(toolbar)
 
-        # ESPAÇADOR DA ESQUERDA (Para centralizar a barra)
+        # ESPAÇADOR DA ESQUERDA
         spacer_left = QWidget()
         spacer_left.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer_left)
@@ -166,9 +180,14 @@ class MiniWordLinux(QMainWindow):
         act_abrir.triggered.connect(self.abrir_arquivo)
         menu_arquivo.addAction(act_abrir)
 
-        act_salvar = QAction("💾 Salvar (Ctrl+S)", self)
+        act_salvar = QAction("💾 Salvar / Salvar Como (Ctrl+S)", self)
         act_salvar.triggered.connect(self.salvar_arquivo)
         menu_arquivo.addAction(act_salvar)
+
+        act_salvar_senha = QAction("🔒 Salvar com Senha... (Ctrl+Shift+S)", self)
+        act_salvar_senha.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        act_salvar_senha.triggered.connect(self.salvar_com_senha)
+        menu_arquivo.addAction(act_salvar_senha)
 
         menu_arquivo.addSeparator()
 
@@ -212,7 +231,7 @@ class MiniWordLinux(QMainWindow):
         # GRUPO 3: FERRAMENTAS & PDF
         # ----------------------------------------------------
         btn_ferramentas = QToolButton(self)
-        btn_ferramentas.setText("✨ Ferramentas & PDF ▾")  # Ícone trocado para ✨ (ou 🛠️)
+        btn_ferramentas.setText("✨ Ferramentas & PDF ▾")
         btn_ferramentas.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu_ferramentas = QMenu(btn_ferramentas)
 
@@ -227,10 +246,49 @@ class MiniWordLinux(QMainWindow):
         btn_ferramentas.setMenu(menu_ferramentas)
         toolbar.addWidget(btn_ferramentas)
 
+        # MENU DE TABELAS
+        btn_tabela = QToolButton(self)
+        btn_tabela.setText("📊 Tabela ▾")
+        btn_tabela.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu_tabela = QMenu(btn_tabela)
+
+        act_inserir_tabela = QAction("➕ Inserir Tabela...", self)
+        act_inserir_tabela.triggered.connect(self.inserir_tabela)
+        menu_tabela.addAction(act_inserir_tabela)
+
+        menu_tabela.addSeparator()
+
+        act_add_linha = QAction("⬇️ Inserir Linha Abaixo", self)
+        act_add_linha.triggered.connect(self.inserir_linha_tabela)
+        menu_tabela.addAction(act_add_linha)
+
+        act_rem_linha = QAction("❌ Remover Linha", self)
+        act_rem_linha.triggered.connect(self.remover_linha_tabela)
+        menu_tabela.addAction(act_rem_linha)
+
+        menu_tabela.addSeparator()
+
+        act_add_coluna = QAction("➡️ Inserir Coluna à Direita", self)
+        act_add_coluna.triggered.connect(self.inserir_coluna_tabela)
+        menu_tabela.addAction(act_add_coluna)
+
+        act_rem_coluna = QAction("❌ Remover Coluna", self)
+        act_rem_coluna.triggered.connect(self.remover_coluna_tabela)
+        menu_tabela.addAction(act_rem_coluna)
+
+        menu_tabela.addSeparator()
+
+        act_prop_tabela = QAction("⚙️ Propriedades da Tabela (Largura)", self)
+        act_prop_tabela.triggered.connect(self.ajustar_propriedades_tabela)
+        menu_tabela.addAction(act_prop_tabela)
+
+        btn_tabela.setMenu(menu_tabela)
+        toolbar.addWidget(btn_tabela)
+
         toolbar.addSeparator()
 
         # ----------------------------------------------------
-        # GRUPO 4: FORMATAÇÃO DE FONTE, ESTILOS (N, I, S) E CORES
+        # GRUPO 4: FORMATAÇÃO DE FONTE, ESTILOS E CORES
         # ----------------------------------------------------
         self.combo_fonte = QFontComboBox()
         self.combo_fonte.setMaximumWidth(160)
@@ -320,7 +378,7 @@ class MiniWordLinux(QMainWindow):
         toolbar.addWidget(btn_alinhamento)
 
         # ----------------------------------------------------
-        # GRUPO 6: FORMATAÇÃO DE PÁGINA (Margens e Espaçamento)
+        # GRUPO 6: FORMATAÇÃO DE PÁGINA
         # ----------------------------------------------------
         btn_formatacao = QToolButton(self)
         btn_formatacao.setText("📏 Formatação ▾")
@@ -348,12 +406,143 @@ class MiniWordLinux(QMainWindow):
         self.btn_leitura.triggered.connect(self.alternar_modo_leitura)
         toolbar.addAction(self.btn_leitura)
 
-        # ESPAÇADOR DA DIREITA (Empurra os botões para o centro)
+        # ESPAÇADOR DA DIREITA
         spacer_right = QWidget()
         spacer_right.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer_right)
 
-    # --- Edição e Formatação de Texto, Cores e Parágrafos ---
+    # --- Manipulação de Tabelas ---
+
+    def inserir_tabela(self):
+        linhas, ok1 = QInputDialog.getInt(self, "Criar Tabela", "Número de Linhas:", 3, 1, 50)
+        if not ok1:
+            return
+        colunas, ok2 = QInputDialog.getInt(self, "Criar Tabela", "Número de Colunas:", 3, 1, 20)
+        if not ok2:
+            return
+
+        cursor = self.editor.textCursor()
+        tabela = cursor.insertTable(linhas, colunas)
+        fmt = tabela.format()
+        fmt.setWidth(QTextLength(QTextLength.Type.PercentageLength, 100))
+        fmt.setBorder(1)
+        fmt.setCellPadding(6)
+        fmt.setCellSpacing(0)
+        tabela.setFormat(fmt)
+        self.statusBar().showMessage(f"Tabela {linhas}x{colunas} inserida.")
+
+    def inserir_linha_tabela(self):
+        cursor = self.editor.textCursor()
+        tabela = cursor.currentTable()
+        if tabela:
+            celula = tabela.cellAt(cursor)
+            tabela.insertRows(celula.row() + 1, 1)
+            self.statusBar().showMessage("Linha inserida.")
+        else:
+            QMessageBox.warning(self, "Atenção", "Posicione o cursor dentro de uma célula da tabela.")
+
+    def remover_linha_tabela(self):
+        cursor = self.editor.textCursor()
+        tabela = cursor.currentTable()
+        if tabela:
+            celula = tabela.cellAt(cursor)
+            tabela.removeRows(celula.row(), 1)
+            self.statusBar().showMessage("Linha removida.")
+        else:
+            QMessageBox.warning(self, "Atenção", "Posicione o cursor dentro de uma célula da tabela.")
+
+    def inserir_coluna_tabela(self):
+        cursor = self.editor.textCursor()
+        tabela = cursor.currentTable()
+        if tabela:
+            celula = tabela.cellAt(cursor)
+            tabela.insertColumns(celula.column() + 1, 1)
+            self.statusBar().showMessage("Coluna inserida.")
+        else:
+            QMessageBox.warning(self, "Atenção", "Posicione o cursor dentro de uma célula da tabela.")
+
+    def remover_coluna_tabela(self):
+        cursor = self.editor.textCursor()
+        tabela = cursor.currentTable()
+        if tabela:
+            celula = tabela.cellAt(cursor)
+            tabela.removeColumns(celula.column(), 1)
+            self.statusBar().showMessage("Coluna removida.")
+        else:
+            QMessageBox.warning(self, "Atenção", "Posicione o cursor dentro de uma célula da tabela.")
+
+    def ajustar_propriedades_tabela(self):
+        cursor = self.editor.textCursor()
+        tabela = cursor.currentTable()
+        if not tabela:
+            QMessageBox.warning(self, "Atenção", "Posicione o cursor dentro da tabela que deseja formatar.")
+            return
+
+        porcentagem, ok = QInputDialog.getInt(
+            self, 
+            "Largura da Tabela", 
+            "Digite a largura total da tabela em porcentagem (10% a 100%):", 
+            100, 10, 100, 5
+        )
+        if ok:
+            fmt = tabela.format()
+            fmt.setWidth(QTextLength(QTextLength.Type.PercentageLength, porcentagem))
+            fmt.setBorder(1)
+            fmt.setCellPadding(6)
+            fmt.setCellSpacing(0)
+            tabela.setFormat(fmt)
+            self.statusBar().showMessage(f"Tabela ajustada para {porcentagem}% da largura da folha.")
+
+    # --- Segurança e Criptografia (.sft) ---
+
+    def gerar_chave(self, senha: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(senha.encode('utf-8')))
+
+    def salvar_com_senha(self):
+        caminho, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Salvar Documento Protegido", 
+            "", 
+            "Documento Protegido Sulfite (*.sft)"
+        )
+        if caminho:
+            if not caminho.endswith('.sft'):
+                caminho += '.sft'
+
+            senha, ok = QInputDialog.getText(
+                self, 
+                "Criar Senha de Proteção", 
+                "Digite uma senha para proteger este documento:", 
+                QLineEdit.EchoMode.Password
+            )
+            if ok and senha:
+                try:
+                    conteudo_html = self.editor.toHtml()
+                    salt = os.urandom(16)
+                    chave = self.gerar_chave(senha, salt)
+                    fernet = Fernet(chave)
+                    
+                    dados_criptografados = fernet.encrypt(conteudo_html.encode('utf-8'))
+                    
+                    with open(caminho, 'wb') as f:
+                        f.write(salt + dados_criptografados)
+                        
+                    self.statusBar().showMessage(f"Documento protegido salvo: {os.path.basename(caminho)}")
+                    QMessageBox.information(
+                        self, 
+                        "Sucesso", 
+                        "Arquivo salvo e protegido com sucesso!\nNinguém poderá abri-lo sem a senha."
+                    )
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro ao Salvar", f"Não foi possível proteger o arquivo: {str(e)}")
+
+    # --- Edição e Formatação ---
 
     def alterar_fonte(self, font):
         self.editor.setCurrentFont(font)
@@ -461,7 +650,7 @@ class MiniWordLinux(QMainWindow):
                 fator = int(val * 100)
 
         fmt = QTextBlockFormat()
-        fmt.setLineHeight(fator, 1) # 1 = Proporcional em porcentagem
+        fmt.setLineHeight(fator, 1)
         cursor = self.editor.textCursor()
         cursor.mergeBlockFormat(fmt)
         self.statusBar().showMessage("Espaçamento de linhas atualizado.")
@@ -489,7 +678,7 @@ class MiniWordLinux(QMainWindow):
             self.atualizar_estilo_edicao()
             self.statusBar().showMessage("Modo Edição Ativado")
 
-    # --- Função de Desfazer (Undo) ---
+    # --- Desfazer e Carimbos ---
 
     def desfazer_acao(self):
         if self.pdf_paginas_imagens and self.historico_pdf_paginas:
@@ -499,8 +688,6 @@ class MiniWordLinux(QMainWindow):
         else:
             self.editor.undo()
             self.statusBar().showMessage("Ação desfeita.")
-
-    # --- Função do Carimbo ---
 
     def adicionar_carimbo(self):
         texto, ok = QInputDialog.getText(self, "Texto do Carimbo", "Digite a palavra do carimbo:", text="PAGO")
@@ -597,16 +784,98 @@ class MiniWordLinux(QMainWindow):
 
     # --- Persistência de Arquivos & Exportação ---
 
-    def abrir_arquivo(self):
-        caminho, _ = QFileDialog.getOpenFileName(
-            self, "Abrir Arquivo", "", 
-            "Documentos Vários (*.html *.htm *.txt *.pdf);;Arquivos PDF (*.pdf);;Documentos HTML (*.html *.htm);;Texto Puro (*.txt)"
-        )
+    def abrir_arquivo(self, caminho_inicial=None):
+        if caminho_inicial:
+            caminho = caminho_inicial
+        else:
+            caminho, _ = QFileDialog.getOpenFileName(
+                self, "Abrir Arquivo", "", 
+                "Todos os Suportados (*.html *.htm *.txt *.pdf *.odt *.docx *.sft);;"
+                "Documentos do Word (*.docx);;"
+                "Documentos ODT (*.odt);;"
+                "Documentos Protegidos Sulfite (*.sft);;"
+                "Arquivos PDF (*.pdf);;"
+                "Documentos HTML (*.html *.htm);;"
+                "Texto Puro (*.txt)"
+            )
+
         if caminho:
             self.caminho_pdf_atual = caminho
             self.historico_pdf_paginas.clear()
-            
-            if caminho.lower().endswith('.pdf'):
+
+            # --- SUPORTE A ARQUIVOS PROTEGIDOS DO SULFITE (.sft) ---
+            if caminho.lower().endswith('.sft'):
+                senha, ok = QInputDialog.getText(
+                    self, 
+                    "Documento Protegido", 
+                    "Este arquivo está protegido com senha.\nDigite a senha para abrir:", 
+                    QLineEdit.EchoMode.Password
+                )
+                if ok and senha:
+                    try:
+                        with open(caminho, 'rb') as f:
+                            conteudo = f.read()
+                            
+                        salt = conteudo[:16]
+                        dados_criptografados = conteudo[16:]
+                        
+                        chave = self.gerar_chave(senha, salt)
+                        fernet = Fernet(chave)
+                        
+                        conteudo_html = fernet.decrypt(dados_criptografados).decode('utf-8')
+                        self.editor.setHtml(conteudo_html)
+                        self.statusBar().showMessage(f"Documento descriptografado carregado: {os.path.basename(caminho)}")
+                    except Exception:
+                        QMessageBox.warning(
+                            self, 
+                            "Senha Incorreta", 
+                            "Não foi possível abrir o documento.\nA senha digitada está incorreta!"
+                        )
+
+            # --- SUPORTE A ARQUIVOS .ODT E .DOCX ---
+            elif caminho.lower().endswith(('.odt', '.docx')):
+                try:
+                    self.pdf_paginas_imagens = []
+                    self.statusBar().showMessage(f"Carregando {os.path.basename(caminho)}...")
+                    QApplication.processEvents()
+
+                    temp_dir = tempfile.gettempdir()
+                    nome_base = os.path.splitext(os.path.basename(caminho))[0] + ".html"
+                    caminho_temp_html = os.path.join(temp_dir, nome_base)
+
+                    if os.path.exists(caminho_temp_html):
+                        os.remove(caminho_temp_html)
+
+                    cmd = [
+                        'libreoffice', '--headless',
+                        f'-env:UserInstallation=file://{temp_dir}/lo_temp_profile',
+                        '--convert-to', 'html', caminho,
+                        '--outdir', temp_dir
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                    if os.path.exists(caminho_temp_html):
+                        with open(caminho_temp_html, 'r', encoding='utf-8', errors='replace') as f:
+                            conteudo_html = f.read()
+
+                        # Remove apenas definições de cor de fundo escuras na tag body para preservar a folha branca
+                        conteudo_html = re.sub(r'body\s*{[^}]*}', '', conteudo_html, flags=re.IGNORECASE)
+
+                        self.editor.setHtml(conteudo_html)
+                        self.statusBar().showMessage(f"Documento carregado com sucesso: {os.path.basename(caminho)}")
+                    else:
+                        QMessageBox.warning(
+                            self, 
+                            "Arquivo Protegido / Erro", 
+                            "Não foi possível ler o arquivo. Se este documento ODT/DOCX tiver senha de proteção, "
+                            "remova-a no LibreOffice/Word para abri-lo no Sulfite."
+                        )
+
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro", f"Falha ao processar arquivo: {str(e)}")
+
+            # --- SUPORTE A ARQUIVOS PDF ---
+            elif caminho.lower().endswith('.pdf'):
                 opcoes_pdf = [
                     "🖼️ Preservar Layout e Imagens (Ideal para boletos/faturas)",
                     "🔍 Reconhecer Texto via OCR (PDF/Imagem para Texto Editável)",
@@ -660,10 +929,13 @@ class MiniWordLinux(QMainWindow):
                     except Exception as e:
                         QMessageBox.critical(self, "Erro", f"Erro ao ler texto do PDF: {str(e)}")
 
-            elif caminho.endswith('.html') or caminho.endswith('.htm'):
+            # --- SUPORTE A ARQUIVOS HTML ---
+            elif caminho.lower().endswith('.html') or caminho.lower().endswith('.htm'):
                 self.pdf_paginas_imagens = []
                 with open(caminho, 'r', encoding='utf-8') as f:
                     self.editor.setHtml(f.read())
+            
+            # --- SUPORTE A TEXTO PURO ---
             else:
                 self.pdf_paginas_imagens = []
                 with open(caminho, 'r', encoding='utf-8') as f:
@@ -674,48 +946,167 @@ class MiniWordLinux(QMainWindow):
             self.exportar_pdf()
             return
 
-        caminho, _ = QFileDialog.getSaveFileName(self, "Salvar Arquivo", "", "Documento HTML (*.html);;Texto Puro (*.txt)")
+        caminho, filtro_selecionado = QFileDialog.getSaveFileName(
+            self, 
+            "Salvar Arquivo", 
+            "", 
+            "Documento do Word (*.docx);;"
+            "Documento ODT (*.odt);;"
+            "Documento Protegido Sulfite (*.sft);;"
+            "Documento PDF (*.pdf);;"
+            "Documento HTML (*.html);;"
+            "Texto Puro (*.txt)"
+        )
+
         if caminho:
-            with open(caminho, 'w', encoding='utf-8') as f:
-                if caminho.endswith('.txt'):
+            if "(*.docx)" in filtro_selecionado or caminho.endswith('.docx'):
+                if not caminho.endswith('.docx'):
+                    caminho += '.docx'
+                self.salvar_como_docx(caminho)
+
+            elif "(*.odt)" in filtro_selecionado or caminho.endswith('.odt'):
+                if not caminho.endswith('.odt'):
+                    caminho += '.odt'
+                self.salvar_como_odt(caminho)
+
+            elif "(*.sft)" in filtro_selecionado or caminho.endswith('.sft'):
+                self.salvar_com_senha_caminho(caminho)
+
+            elif "(*.pdf)" in filtro_selecionado or caminho.endswith('.pdf'):
+                self.exportar_pdf_caminho(caminho)
+
+            elif caminho.endswith('.txt'):
+                with open(caminho, 'w', encoding='utf-8') as f:
                     f.write(self.editor.toPlainText())
-                else:
+                self.statusBar().showMessage(f"Arquivo salvo: {os.path.basename(caminho)}")
+
+            else:
+                if not caminho.endswith('.html'):
+                    caminho += '.html'
+                with open(caminho, 'w', encoding='utf-8') as f:
                     f.write(self.editor.toHtml())
+                self.statusBar().showMessage(f"Arquivo salvo: {os.path.basename(caminho)}")
+
+    def salvar_como_docx(self, caminho_saida):
+        try:
+            temp_dir = tempfile.gettempdir()
+            caminho_temp_html = os.path.join(temp_dir, "temp_export_word.html")
+
+            with open(caminho_temp_html, 'w', encoding='utf-8') as f:
+                f.write(self.editor.toHtml())
+
+            cmd = [
+                'libreoffice', '--headless',
+                '--convert-to', 'docx', caminho_temp_html,
+                '--outdir', os.path.dirname(caminho_saida)
+            ]
+            subprocess.run(cmd, check=True)
+
+            arquivo_gerado = os.path.join(os.path.dirname(caminho_saida), "temp_export_word.docx")
+            if os.path.exists(arquivo_gerado):
+                if os.path.exists(caminho_saida):
+                    os.remove(caminho_saida)
+                os.rename(arquivo_gerado, caminho_saida)
+
+            self.statusBar().showMessage(f"Documento Word (.docx) salvo com sucesso: {os.path.basename(caminho_saida)}")
+            QMessageBox.information(self, "Sucesso", f"Arquivo DOCX gerado em:\n{caminho_saida}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao Salvar DOCX", f"Não foi possível gerar o arquivo Word: {str(e)}")
+
+    def salvar_como_odt(self, caminho_saida):
+        try:
+            temp_dir = tempfile.gettempdir()
+            caminho_temp_html = os.path.join(temp_dir, "temp_export.html")
+
+            with open(caminho_temp_html, 'w', encoding='utf-8') as f:
+                f.write(self.editor.toHtml())
+
+            cmd = [
+                'libreoffice', '--headless',
+                '--convert-to', 'odt', caminho_temp_html,
+                '--outdir', os.path.dirname(caminho_saida)
+            ]
+            subprocess.run(cmd, check=True)
+
+            arquivo_gerado = os.path.join(os.path.dirname(caminho_saida), "temp_export.odt")
+            if os.path.exists(arquivo_gerado):
+                if os.path.exists(caminho_saida):
+                    os.remove(caminho_saida)
+                os.rename(arquivo_gerado, caminho_saida)
+
+            self.statusBar().showMessage(f"Documento ODT salvo com sucesso: {os.path.basename(caminho_saida)}")
+            QMessageBox.information(self, "Sucesso", f"Arquivo ODT gerado em:\n{caminho_saida}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao Salvar ODT", f"Não foi possível gerar o arquivo ODT: {str(e)}")
+
+    def salvar_com_senha_caminho(self, caminho):
+        if not caminho.endswith('.sft'):
+            caminho += '.sft'
+
+        senha, ok = QInputDialog.getText(
+            self, 
+            "Criar Senha de Proteção", 
+            "Digite uma senha para proteger este documento:", 
+            QLineEdit.EchoMode.Password
+        )
+        if ok and senha:
+            try:
+                conteudo_html = self.editor.toHtml()
+                salt = os.urandom(16)
+                chave = self.gerar_chave(senha, salt)
+                fernet = Fernet(chave)
+                
+                dados_criptografados = fernet.encrypt(conteudo_html.encode('utf-8'))
+                
+                with open(caminho, 'wb') as f:
+                    f.write(salt + dados_criptografados)
+                    
+                self.statusBar().showMessage(f"Documento protegido salvo: {os.path.basename(caminho)}")
+                QMessageBox.information(
+                    self, 
+                    "Sucesso", 
+                    "Arquivo salvo e protegido com sucesso!\nNinguém poderá abri-lo sem a senha."
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Erro ao Salvar", f"Não foi possível proteger o arquivo: {str(e)}")
+
+    def exportar_pdf_caminho(self, caminho):
+        if not caminho.endswith('.pdf'):
+            caminho += '.pdf'
+            
+        if self.pdf_paginas_imagens:
+            try:
+                self.statusBar().showMessage("Gerando arquivo PDF final...")
+                QApplication.processEvents()
+                
+                primeira_pagina = self.pdf_paginas_imagens[0].convert('RGB')
+                demais_paginas = [img.convert('RGB') for img in self.pdf_paginas_imagens[1:]]
+                
+                primeira_pagina.save(caminho, save_all=True, append_images=demais_paginas)
+                
+                self.statusBar().showMessage("PDF salvo com sucesso!")
+                QMessageBox.information(self, "Sucesso", f"PDF salvo com sucesso em:\n{caminho}")
+            except Exception as e:
+                QMessageBox.critical(self, "Erro", f"Falha ao salvar PDF: {str(e)}")
+        else:
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(caminho)
+            
+            layout = QPageLayout(
+                QPageSize(QPageSize.PageSizeId.A4),
+                QPageLayout.Orientation.Portrait,
+                Qt.Edge.Margins
+            )
+            printer.setPageLayout(layout)
+            
+            self.editor.document().print(printer)
+            QMessageBox.information(self, "Sucesso", f"PDF gerado com sucesso em:\n{caminho}")
 
     def exportar_pdf(self):
         caminho, _ = QFileDialog.getSaveFileName(self, "Exportar/Salvar como PDF", "", "Arquivo PDF (*.pdf)")
         if caminho:
-            if not caminho.endswith('.pdf'):
-                caminho += '.pdf'
-                
-            if self.pdf_paginas_imagens:
-                try:
-                    self.statusBar().showMessage("Gerando arquivo PDF final...")
-                    QApplication.processEvents()
-                    
-                    primeira_pagina = self.pdf_paginas_imagens[0].convert('RGB')
-                    demais_paginas = [img.convert('RGB') for img in self.pdf_paginas_imagens[1:]]
-                    
-                    primeira_pagina.save(caminho, save_all=True, append_images=demais_paginas)
-                    
-                    self.statusBar().showMessage("PDF salvo com sucesso!")
-                    QMessageBox.information(self, "Sucesso", f"PDF salvo com sucesso em:\n{caminho}")
-                except Exception as e:
-                    QMessageBox.critical(self, "Erro", f"Falha ao salvar PDF: {str(e)}")
-            else:
-                printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-                printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-                printer.setOutputFileName(caminho)
-                
-                layout = QPageLayout(
-                    QPageSize(QPageSize.PageSizeId.A4),
-                    QPageLayout.Orientation.Portrait,
-                    Qt.Edge.Margins
-                )
-                printer.setPageLayout(layout)
-                
-                self.editor.document().print(printer)
-                QMessageBox.information(self, "Sucesso", f"PDF gerado com sucesso em:\n{caminho}")
+            self.exportar_pdf_caminho(caminho)
 
     def juntar_pdfs(self):
         arquivos, _ = QFileDialog.getOpenFileNames(
@@ -747,7 +1138,6 @@ class MiniWordLinux(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # Vincula o processo ao atalho do menu do Linux Mint
     app.setDesktopFileName("TextEditor.desktop")
     
     janela = MiniWordLinux()
